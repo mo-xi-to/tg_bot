@@ -1,122 +1,129 @@
 import re
+import os
 import json
 from openai import AsyncOpenAI
+from typing import List, Dict, Any
 from datetime import datetime, timedelta, timezone
 
 from config import API_KEY
+from app.logger import logger
 
-client = AsyncOpenAI(
-  base_url="https://openrouter.ai/api/v1",
-  api_key=API_KEY
-)
-
-async def extract_tasks_from_ai(prompt, user_timezone_offset, tasks_list, history_list):
-  if tasks_list:
-    tasks_info = []
-    for t in tasks_list:
-      time_str = t.deadline.strftime("%d.%m.%Y %H:%M")
-      tasks_info.append(f"- {t.name} (Срок: {time_str}, Описание: {t.description or 'нет'})")
-    tasks_str = "\n".join(tasks_info)
-  else:
-    tasks_str = "Список задач пуст."
+class AI:
+  MODEL = "xiaomi/mimo-v2-flash:free"
+  BASE_URL = "https://openrouter.ai/api/v1"
     
-  now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-  user_time = now_utc + timedelta(hours=user_timezone_offset)
-  current_time_str = user_time.strftime("%Y-%m-%d %H:%M:%S")
+  client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
 
-  full_prompt = f"""Ты - умный ассистент по тайм-менеджменту. 
-    Текущее время пользователя: {current_time_str}.
+  PROMPTS_DIR = "app/prompts"
     
-    СПИСОК ТЕКУЩИХ ЗАДАЧ:
-    {tasks_str}
-    
-    Твоя задача: Проанализируй сообщение и ИСТОРИЮ чата и выдели ВСЕ действия. Пользователь может просить сделать несколько вещей сразу.
-    ИНСТРУКЦИИ:
-    1. ДОБАВЛЕНИЕ (added_tasks):  Список новых задач.
-    2. УДАЛЕНИЕ (deleted_tasks): Список ТОЧНЫХ названий задач из списка выше, которые нужно удалить.
-    3. ОБНОВЛЕНИЕ (updated_tasks): Список объектов, где "old_name" — точное имя из списка выше, а "new_data" - словарь с измененными полями.
-    4. ПРОСМОТР: Формируй список задач в поле "reply" ТОЛЬКО если пользователь прямо попросил показать планы. Если просит задачи на конкретный день - выбери только их.
-    5. ОБЩЕНИЕ И СОВЕТЫ: Если пользователь спрашивает совета по продуктивности или просто хочет обсудить свои планы - дай развернутый, мотивирующий 
-      и полезный ответ в поле "reply". Ты должен быть экспертом в этой теме.
-    6. ДУБЛИКАТЫ: Список названий задач, которые пользователь хочет добавить, но они УЖЕ есть в базе.
-      Сравнивай каждую новую задачу со "СПИСКОМ ТЕКУЩИХ ЗАДАЧ". Если задача уже есть (даже если она написана другими словами, но смысл тот же), 
-      НЕ добавляй её в "added_tasks". Просто скажи, что эта задача уже есть в списке.
-    7. КОНТЕКСТНЫЕ ДОПОЛНЕНИЯ: Если пользователь пишет фразу (например: "и молоко", "а еще чай", "и хлеб"), это ЗНАЧИТ, что он 
-      дополняет свою ПОСЛЕДНЮЮ созданную или обсуждаемую задачу. В этом случае КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО создавать новую задачу в 'added_tasks'.
-      Ты должен использовать 'updated_tasks':
-        1. "old_name": Точное имя задачи из списка выше (например, "Купить хлеб").
-        2. "new_data": Новое объединенное имя (например, "Купить хлеб и молоко").
+  _prompts_cache: Dict[str, str] = {}
 
-    Верни СТРОГО JSON:
-    {{
-      "added_tasks": [ {{ "name": "...", "description": "...", "deadline": "ГГГГ-ММ-ДД ЧЧ:ММ:СС" }} ],
-      "deleted_tasks": ["Точное имя 1", "Точное имя 2"],
-      "updated_tasks": [
-        {{
-          "old_name": "Точное имя из списка",
-          "new_data": {{ "name": "новое имя", "description": "...", "deadline": "...", "is_reminded": false }}
-        }}
-      ],
+  @classmethod
+  def _get_prompt(cls, filename: str) -> str:
+        
+    """Приватный метод для чтения промптов с кэшированием"""
 
-      "reply": "ОБЯЗАТЕЛЬНО вежливый общий ответ о проделанной работе. Здесь используй эмодзи."
-    }}
-    
-    Сообщение пользователя: "{prompt}" """
+    if filename not in cls._prompts_cache:
+      path = os.path.join(cls.PROMPTS_DIR, filename)
+            
+      try:
+        with open(path, 'r', encoding='utf-8') as f:
+          cls._prompts_cache[filename] = f.read()
+            
+      except FileNotFoundError:
+        logger.error(f"Файл промпта не найден: {path}")
+        return ""
+        
+    return cls._prompts_cache.get(filename, "")
 
-  messages = [{"role": "system", "content": full_prompt}]
+  @classmethod
+  async def _ask_ai(cls, messages: List[Dict[str, str]], json_mode: bool = False) -> str:
+      
+    """Единый внутренний метод для всех запросов к ИИ"""
 
-  for msg in history_list:
-    messages.append({"role": msg.role, "content": msg.content})
-  
-  messages.append({"role": "user", "content": prompt})
+    try:
+      kwargs = {
+        "model": cls.MODEL,
+        "messages": messages,
+      }
+        
+      if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
 
-  completion = await client.chat.completions.create(
-    model="meta-llama/llama-3.3-70b-instruct:free",
-    messages=messages
-  )
-    
-  raw_text = completion.choices[0].message.content
-  match = re.search(r'(\{.*\})', raw_text, re.DOTALL)
-  return json.loads(match.group(1))
+      completion = await cls.client.chat.completions.create(**kwargs)
+        
+      return completion.choices[0].message.content or ""
+      
+    except Exception as e:
+      logger.error(f"Ошибка API OpenRouter: {e}")
+      raise e
 
-async def generate_morning_report(name, tasks_list):
-  if tasks_list:
-    for t in tasks_list:
-      tasks_text = "\n".join([f"- {t.name} (в {t.deadline.strftime('%H:%M')})"])
-  else:
-    tasks_text = "Планов на сегодня нет."
+  @staticmethod
+  def _parse_json(text: str) -> Dict[str, Any]:
+        
+    """Универсальный и безопасный парсер JSON из текста"""
 
-  prompt = f"""
-  Ты - заботливый личный ассистент по тайм-менеджменту. 
-  Поприветствуй пользователя по имени {name}.
-  Вот его задачи из базы данных на сегодня:
-  {tasks_text}
+    try:
+      return json.loads(text)
+      
+    except json.JSONDecodeError:
+      match = re.search(r'(\{.*\})', text, re.DOTALL)
+        
+      if match:
+        try:
+          return json.loads(match.group(1))
+          
+        except:
+          pass
+        
+    return {"added_tasks": [], "deleted_tasks": [], "updated_tasks": [], "reply": text}
+
+  @classmethod
+  async def extract_tasks_from_ai(cls, prompt: str, tz_offset: int, tasks: List[Any], history: List[Any]) -> Dict[str, Any]:
+      
+    """Извлечение задач из текста"""
+
+    tasks_str = "\n".join([f"- {t.name}" for t in tasks]) if tasks else "Пусто"
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    time_str = (now + timedelta(hours=tz_offset)).strftime("%Y-%m-%d %H:%M:%S")
+
+    template = cls._get_prompt('system_prompt.txt')
+    system_instructions = template.format(
+      current_time_str=time_str, 
+      tasks_str=tasks_str
+    )
+
+    messages = [
+      {"role": "system", "content": system_instructions},
+    ]
+
+    for msg in history:
+      messages.append({"role": msg.role, "content": msg.content})
+
+    messages.append({"role": "user", "content": prompt})
+
+    raw_response = await cls._ask_ai(messages, json_mode=True)
     
-  Твоя задача:
-  1. Перечисли ТОЛЬКО те задачи, которые указаны выше. 
-  2. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО придумывать новые задачи, которых нет в списке.
-  3. Если список пуст, просто пожелай хорошего отдыха.
-  4. Если задачи есть, кратко напомни о них и пожелай удачи.
+    return cls._parse_json(raw_response)
+
+  @classmethod
+  async def generate_morning_report(cls, name: str, tasks: List[Any]) -> str:
     
-  Пиши кратко и по делу. Используй эмодзи.
-  """
-  completion = await client.chat.completions.create(
-    model="meta-llama/llama-3.3-70b-instruct:free",
-    messages=[{"role": "user", "content": prompt}]
-  )
-  return completion.choices[0].message.content
+    """Генерация утреннего дайджеста"""
     
-async def generate_ai_reminder_text(user_name, task_name, description):
-  prompt = f"""
-  Ты - заботливый личный ассистент. 
-  Тебе нужно напомнить пользователю по имени {user_name} о задаче: "{task_name}".
-  Дополнительное описание задачи: "{description or 'нет описания'}".
+    tasks_text = "\n".join([f"- {t.name} ({t.deadline.strftime('%H:%M')})" for t in tasks]) if tasks else "Планов нет."
+        
+    template = cls._get_prompt('morning_report.txt')
+    prompt = template.format(name=name, tasks_text=tasks_text)
+
+    return await cls._ask_ai([{"role": "user", "content": prompt}])
+
+  @classmethod
+  async def generate_ai_reminder_text(cls, name: str, tasks_data: str) -> str:
     
-  Напиши короткое (1-2 предложения), дружелюбное и бодрое напоминание. 
-  Используй эмодзи. Не будь слишком официальным.
-  """
-  completion = await client.chat.completions.create(
-    model="meta-llama/llama-3.3-70b-instruct:free",
-    messages=[{"role": "user", "content": prompt}]
-  )
-  return completion.choices[0].message.content
+    """Генерация текста для напоминания"""
+    
+    template = cls._get_prompt('reminder.txt')
+    prompt = template.format(user_name=name, tasks_data=tasks_data)
+
+    return await cls._ask_ai([{"role": "user", "content": prompt}])
